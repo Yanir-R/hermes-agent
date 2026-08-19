@@ -35,6 +35,7 @@ informative rejection instead of scheduling a job that will only fail
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import shlex
@@ -101,6 +102,25 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
+
+# THE ONE PLACE THIS RULE IS WRITTEN. `cron/scheduler.py` picks a job's
+# interpreter by extension -- .sh/.bash under bash, everything else under
+# python -- and deliberately does NOT honour the shebang. This guard must make
+# the SAME choice, for the reason `_resolve_script_path` mirrors the
+# scheduler's path resolution: a guard that scans a file as shell while the
+# scheduler runs it as Python is auditing a program that will not exist.
+SHELL_SCRIPT_SUFFIXES = frozenset({".sh", ".bash"})
+
+# Callables whose string arguments reach a shell or an argv. A closed list of
+# stdlib exec surfaces rather than a heuristic: a name absent from it
+# contributes nothing, which under-reports rather than over-reports. That is
+# the right direction for a SCAN, because `terminal_tool`'s in-gateway block
+# and the gateway's own self-target refusal are the layers that actually stop
+# the loop -- see this module's docstring on defence in depth.
+_EXEC_CALL_NAMES = frozenset({
+    "system", "popen", "run", "call", "check_call", "check_output",
+    "Popen", "getoutput", "getstatusoutput", "spawn", "execv", "execvp",
+})
 _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
@@ -110,6 +130,78 @@ _CONTROL_CHARS = frozenset(";&|()")
 
 
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
+
+
+def _literal_strings(node) -> Iterator[str]:
+    """Every string constant reachable from *node* without leaving the literal.
+
+    Sequence elements are joined by the caller so an argv form reads as the
+    command line it becomes: ["hermes", "gateway", "restart"] has to look like
+    `hermes gateway restart` for the existing pattern to see it. f-string
+    interpolations are unknowable here and contribute nothing, the same limit
+    as a concatenation.
+    """
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, str):
+            yield node.value
+    elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        for element in node.elts:
+            yield from _literal_strings(element)
+    elif isinstance(node, ast.JoinedStr):
+        for value in node.values:
+            yield from _literal_strings(value)
+
+
+def _python_exec_arguments(source: str) -> Iterator[str]:
+    """Command text a Python source could hand to a shell or an argv.
+
+    Only literals passed to a name in `_EXEC_CALL_NAMES`, matched on the
+    attribute rather than the module so `os.system`, `subprocess.run` and a
+    bare `run` from `from subprocess import run` all resolve alike.
+
+    WHAT THIS DELIBERATELY DOES NOT SEE, stated because scanning less is the
+    point: a command assembled through a variable, through concatenation, or
+    passed to a wrapper whose own name is not in the list. All three are missed
+    by the raw-text scan this replaces for Python too -- and that scan
+    additionally misses the IDIOMATIC argv form, which this catches. Measured
+    on the reporting machine: raw text found one match across 42 Python files
+    and it was a false positive. Zero true positives.
+    """
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+        if name not in _EXEC_CALL_NAMES:
+            continue
+        for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+            parts = list(_literal_strings(argument))
+            if parts:
+                yield " ".join(parts)
+
+
+def scannable_text(raw: str, path: Optional[Path]) -> str:
+    """The part of *raw* that can actually reach a shell.
+
+    Shell scripts are scanned whole, byte for byte, exactly as before: in a
+    shell every line IS a command, so there is nothing to narrow and narrowing
+    would cost real coverage -- `pkill -f "hermes.*gateway"` lives inside
+    quotes by necessity, and branch D exists for it.
+
+    Everything else is Python by the scheduler's dispatch, where a raw scan is
+    a category error: it reads prose, docstrings and fault messages as
+    commands. That produced the exact reverse of a guard -- refusing a job for
+    a remediation string telling a human what to run, while missing
+    `subprocess.run(["hermes", "gateway", "restart"])`.
+
+    A file that will not parse falls back to the raw scan: unparseable means
+    unknowable, and unknowable fails closed.
+    """
+    if path is not None and path.suffix.lower() in SHELL_SCRIPT_SUFFIXES:
+        return raw
+    try:
+        return "\n".join(_python_exec_arguments(raw))
+    except (SyntaxError, ValueError, RecursionError):
+        return raw
 
 
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
@@ -252,7 +344,13 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError, not only OSError: a path carrying a NUL byte raises
+        # `ValueError: embedded null character` rather than an OSError, and an
+        # uncaught one reaches the operator AS THE BLOCK REASON, because
+        # GatewayLifecycleBlocked subclasses ValueError. Reachable from
+        # ordinary input -- a referenced binary under the 1MiB cap is read,
+        # decoded with errors="replace", and recursed into as shell text.
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -324,7 +422,10 @@ def _contains_unsafe_gateway_action(
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
-        except OSError:
+        except (OSError, ValueError):
+            # Same NUL-byte case as the open above; `lstat` raises ValueError.
+            # An unresolvable path is not a lifecycle command, it is a path
+            # this scan cannot follow.
             resolved = script_path
         if resolved in visited:
             continue
@@ -341,7 +442,7 @@ def _contains_unsafe_gateway_action(
         # directory, not the original command's cwd.
         script_dir = _resolve_script_directory(str(resolved)) or cwd
         if script_text and _contains_unsafe_gateway_action(
-            script_text,
+            scannable_text(script_text, resolved),
             cwd=script_dir,
             depth=depth + 1,
             visited=visited,
@@ -421,7 +522,13 @@ def check_gateway_lifecycle(
     if script:
         script_text = _read_script_for_scanning(script)
         if script_text:
-            combined = f"{combined}\n{script_text}"
+            # Narrowed by interpreter BEFORE joining: a prompt is prose fed to
+            # an LLM and a script is a program, so concatenating first would
+            # scan the program as prose.
+            combined = (
+                f"{combined}\n"
+                f"{scannable_text(script_text, _resolve_script_path(script))}"
+            )
 
     script_dir = _resolve_script_directory(script) if script else None
     if contains_gateway_lifecycle_command_or_referenced_script(

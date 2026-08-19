@@ -871,3 +871,129 @@ print("ok")
         rc = cron_command(args)
         assert rc == 1
         assert "Blocked" in capsys.readouterr().out
+
+    def test_a_python_fault_message_naming_the_command_does_not_block_the_job(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Remediation advice is not an invocation.
+
+        `trinity_health.py` tells an operator "...then `hermes gateway restart`."
+        in a fault message. Scanned as shell text that matched, so a live
+        registered job became unschedulable for a string addressed to a human.
+
+        THE LITERAL MUST BE A LIVE CALL ARGUMENT, not a bare module docstring:
+        a fixture using a docstring passes under a naive strip-docstrings fix
+        for the wrong reason, which is the fixture-shape trap the directory
+        commit on this branch already recorded once.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts_dir = tmp_path / ".hermes" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "job.py").write_text(
+            'faults = []\n'
+            'faults.append("PATCH: re-apply the patch, then `hermes gateway restart`.")\n'
+            'print(faults)\n'
+        )
+        args = Namespace(
+            cron_command="create", schedule="1h", prompt=None, name=None,
+            deliver=None, repeat=None, skill=None, skills=None,
+            script="job.py", workdir=None, profile=None, no_agent=True,
+        )
+        assert cron_command(args) == 0, capsys.readouterr().out
+
+    def test_a_python_argv_list_blocks_the_job(self, tmp_path, capsys, monkeypatch):
+        """The coverage this change BUYS, and the reason it is not a weakening.
+
+        `subprocess.run(["hermes", "gateway", "restart"])` is the idiomatic form
+        and the raw-text scan missed it entirely -- the pattern needs the words
+        adjacent, and an argv list separates them with quotes and commas.
+        Measured before this change: across 42 Python scripts on the reporting
+        machine the raw scan produced one match, and it was the false positive
+        above. Zero true positives.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts_dir = tmp_path / ".hermes" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "job.py").write_text(
+            "import subprocess\n"
+            'subprocess.run(["hermes", "gateway", "restart"])\n'
+        )
+        args = Namespace(
+            cron_command="create", schedule="1h", prompt=None, name=None,
+            deliver=None, repeat=None, skill=None, skills=None,
+            script="job.py", workdir=None, profile=None, no_agent=True,
+        )
+        assert cron_command(args) == 1
+        assert "Blocked" in capsys.readouterr().out
+
+    def test_a_shell_script_is_scanned_whole_regardless_of_its_shebang(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Dispatch is by EXTENSION, mirroring cron/scheduler.py, never by shebang.
+
+        The scheduler picks bash for .sh/.bash and python for everything else,
+        and says it deliberately ignores the shebang. If this guard sniffed the
+        shebang instead, it would scan a program the scheduler will not run --
+        the scan/run divergence `_resolve_script_path` exists to prevent, one
+        level up. This test is what fails if someone "improves" it to sniff.
+
+        It also pins that shell narrowing did NOT happen: an echoed command in
+        a .sh still blocks, because in a shell every line is a command and
+        narrowing there would cost `pkill -f "hermes.*gateway"`, which lives
+        inside quotes by necessity.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts_dir = tmp_path / ".hermes" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "job.sh").write_text(
+            "#!/usr/bin/env python3\necho 'hermes gateway restart'\n"
+        )
+        args = Namespace(
+            cron_command="create", schedule="1h", prompt=None, name=None,
+            deliver=None, repeat=None, skill=None, skills=None,
+            script="job.sh", workdir=None, profile=None, no_agent=True,
+        )
+        assert cron_command(args) == 1
+        assert "Blocked" in capsys.readouterr().out
+
+    def test_an_unparseable_python_script_falls_back_to_the_raw_scan(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Unparseable means unknowable, and unknowable fails closed."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts_dir = tmp_path / ".hermes" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "job.py").write_text(
+            "def broken(:\nos.system('hermes gateway restart')\n"
+        )
+        args = Namespace(
+            cron_command="create", schedule="1h", prompt=None, name=None,
+            deliver=None, repeat=None, skill=None, skills=None,
+            script="job.py", workdir=None, profile=None, no_agent=True,
+        )
+        assert cron_command(args) == 1
+        assert "Blocked" in capsys.readouterr().out
+
+    def test_a_referenced_path_with_a_null_byte_returns_a_verdict_not_a_crash(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """`GatewayLifecycleBlocked` subclasses ValueError, so an uncaught
+        ValueError from `lstat`/`open` reaches the operator AS THE BLOCK REASON:
+        they are told their job was refused because of "embedded null character
+        in path". Reachable from ordinary input -- a referenced binary under the
+        1MiB cap is read, decoded with errors="replace", and recursed into as
+        shell text, and any NUL in it becomes a path token.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts_dir = tmp_path / ".hermes" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "blob.sh").write_bytes(b"#!/bin/bash\n/tmp/a\x00b -i x\n")
+        (scripts_dir / "job.sh").write_text("#!/bin/bash\n/bin/bash blob.sh\n")
+        args = Namespace(
+            cron_command="create", schedule="1h", prompt=None, name=None,
+            deliver=None, repeat=None, skill=None, skills=None,
+            script="job.sh", workdir=None, profile=None, no_agent=True,
+        )
+        rc = cron_command(args)          # must not raise
+        assert rc in (0, 1)
+        assert "embedded null character" not in capsys.readouterr().out
