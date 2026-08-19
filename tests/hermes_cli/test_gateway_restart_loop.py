@@ -795,3 +795,79 @@ class TestCronCreateLifecycleBlockExtra:
         assert rc == 1
         out = capsys.readouterr().out
         assert "Blocked" in out
+
+    def test_a_directory_mentioned_in_a_script_does_not_block_the_job(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """A directory is not a script, so mentioning one is not a lifecycle command.
+
+        Reported against a real job: a script whose module docstring documented a
+        privacy boundary ("~/Trinity-Wiki -- the vault plaintext-mirrors to Google
+        Drive nightly") could not be scheduled. The tokenizer read that path as a
+        referenced script, `_read_referenced_script` found a non-regular file and
+        returned unsafe, and the operator was told the job "contains a gateway
+        lifecycle command or persistent launchctl submit operation". It contains
+        neither -- `contains_gateway_lifecycle_command` on the same text is False.
+
+        The guard was answering "could I read every path this file mentions?" and
+        reporting the answer to "does this file contain a lifecycle command?".
+
+        A directory can never be the execution vector this guard exists to close:
+        `bash somedir` fails, so no reachable command shape hides behind one. FIFOs,
+        sockets and devices still fail closed -- see the test below -- because those
+        CAN be read and their contents can differ between the scan and the run.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts_dir = tmp_path / ".hermes" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (tmp_path / "some-vault").mkdir()
+        # In a DOCSTRING, not a `#` comment: the tokenizer drops `#` comments, so
+        # a shell-style comment never reaches the path resolver and would make
+        # this test pass for the wrong reason. The reported case was a Python
+        # module docstring, which is ordinary content to the lexer.
+        # The path must LEAD a line, which is what makes the tokenizer read it
+        # as a command token, and it must contain "/" -- the two conditions
+        # `_iter_referenced_shell_scripts`'s final branch keys on. That is
+        # exactly how the reported docstring indented it, and a fixture that
+        # buries the path mid-sentence passes without the fix.
+        (scripts_dir / "job.sh").write_text(
+            f'''"""Boundary note.
+
+Writes: its own profile directory and nothing else. Not the vault --
+    {tmp_path / "some-vault"} plaintext-mirrors to Drive nightly and every
+    byte here is third-party conversation.
+"""
+print("ok")
+'''
+        )
+        args = Namespace(
+            cron_command="create", schedule="1h", prompt=None, name=None,
+            deliver=None, repeat=None, skill=None, skills=None,
+            script="job.sh", workdir=None, profile=None, no_agent=True,
+        )
+        rc = cron_command(args)
+        assert rc == 0, capsys.readouterr().out
+
+    def test_a_fifo_referenced_by_a_script_still_fails_closed(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The half that must NOT be relaxed alongside the directory case.
+
+        A FIFO can be read, and what it yields to this scan need not be what it
+        yields when the job runs. That is a real TOCTOU vector, so it keeps the
+        conservative answer -- which is only defensible while the directory case,
+        where no such vector exists, has stopped sharing it.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts_dir = tmp_path / ".hermes" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        os.mkfifo(scripts_dir / "piped.sh")
+        (scripts_dir / "outer.sh").write_text("#!/bin/bash\n/bin/bash piped.sh\n")
+        args = Namespace(
+            cron_command="create", schedule="1h", prompt=None, name=None,
+            deliver=None, repeat=None, skill=None, skills=None,
+            script="outer.sh", workdir=None, profile=None, no_agent=True,
+        )
+        rc = cron_command(args)
+        assert rc == 1
+        assert "Blocked" in capsys.readouterr().out

@@ -256,7 +256,33 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     try:
         metadata = os.fstat(descriptor)
+        if stat.S_ISDIR(metadata.st_mode):
+            # A DIRECTORY IS NOT A SCRIPT THAT COULD NOT BE READ. It is a token
+            # that was never a script reference, and it cannot be the execution
+            # vector this guard exists to close: `bash somedir` fails, so no
+            # command shape hides behind one.
+            #
+            # It used to share the conservative answer below, which made any
+            # job unschedulable if its script mentioned a directory path at the
+            # start of a line -- `_iter_referenced_shell_scripts` reads a
+            # leading token containing "/" as a command. Reported against a
+            # script whose module docstring documented a privacy boundary
+            # ("Not the vault -- <path> plaintext-mirrors to Drive nightly").
+            # The operator was told the job "contains a gateway lifecycle
+            # command or persistent launchctl submit operation"; it contained
+            # neither, and `contains_gateway_lifecycle_command` on the same
+            # text returns False.
+            #
+            # That is the failure mode this module warns about in its own
+            # docstring, from the other side: the check was answering "could I
+            # read every path this file mentions?" and reporting the answer to
+            # "does this file contain a lifecycle command?".
+            return None, False
         if not stat.S_ISREG(metadata.st_mode):
+            # FIFOs, sockets and devices keep failing closed, and the asymmetry
+            # with the directory case above is the point: these CAN be read,
+            # and what they yield to this scan need not be what they yield when
+            # the job runs.
             return None, True
         if metadata.st_size > _MAX_REFERENCED_SCRIPT_BYTES:
             return None, True
