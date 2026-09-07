@@ -108,6 +108,37 @@ def get_safe_write_roots() -> set[str]:
     return roots
 
 
+def get_read_deny_roots() -> set[str]:
+    """Return resolved HERMES_READ_DENY_ROOT directory roots. Same shape as
+    ``get_safe_write_roots()``, opposite polarity: this is a DENYLIST added on
+    top of the built-in credential-store denials below, not an allowlist.
+    Supports multiple directories separated by ``os.pathsep``.
+
+    For a personal deployment where a profile represents someone other than
+    the operator (a third-party DM/group channel, a shared trial sandbox), the
+    operator's own personal notes/vault are reachable by the profile's core
+    ``terminal``/``read_file`` tools like any other path on disk — nothing in
+    this module's built-in denylist covers them, because that list is scoped
+    to Hermes's own credential stores, not the operator's own files. Setting
+    this per-profile (its own ``.env``, not the shared root one) closes the
+    ordinary case the same way the built-in denials do: same defense-in-depth
+    caveat applies (see ``get_read_block_error``'s docstring) — a determined
+    model can still reach the path via a shell command the terminal tool
+    doesn't recognize as a plain read."""
+    env = os.getenv("HERMES_READ_DENY_ROOT", "")
+    if not env:
+        return set()
+    roots: set[str] = set()
+    for path in env.split(os.pathsep):
+        if path:
+            try:
+                resolved = os.path.realpath(os.path.expanduser(path))
+                roots.add(resolved)
+            except (OSError, ValueError):
+                continue
+    return roots
+
+
 def build_write_approval_paths(home: str) -> set[str]:
     """Return paths that require human APPROVAL to write, but are not
     hard-denied credentials.
@@ -385,6 +416,25 @@ def get_read_block_error(path: str) -> Optional[str]:
             "and cannot be read to prevent credential leakage. "
             "If you need to check the file structure, read .env.example instead. "
             "(Defense-in-depth — not a security boundary; the terminal tool can still bypass.)"
+        )
+
+    # Operator-designated deny roots (HERMES_READ_DENY_ROOT), e.g. a
+    # personal notes vault outside Hermes entirely. Checked last, after every
+    # built-in category above, since those are unconditional and this one is
+    # opt-in per profile. Same defense-in-depth caveat as everything above —
+    # see get_read_deny_roots()'s docstring.
+    deny_roots = get_read_deny_roots()
+    for root in deny_roots:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            if resolved != Path(root):
+                continue
+        return (
+            f"Access denied: {path} is under a directory this profile is "
+            "configured not to read directly (HERMES_READ_DENY_ROOT). "
+            "(Defense-in-depth — not a security boundary; the terminal tool "
+            "can still bypass.)"
         )
 
     return None
