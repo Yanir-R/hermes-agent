@@ -288,3 +288,61 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+
+
+# ---------------------------------------------------------------------------
+# TRI-349 — a profile cannot remove a credential it only reads via fallback
+# ---------------------------------------------------------------------------
+
+
+def test_profile_remove_of_global_only_credential_refuses_with_the_right_cause(
+    profile_env,
+):
+    """Removing the last profile-visible credential is a silent no-op.
+
+    Writes target the profile; reads fall back to the global root when the
+    profile's slice for that provider is EMPTY. Removing a credential the
+    profile only sees through that fallback therefore writes ``[]`` and the
+    very next read hands the credential straight back — the same
+    reported-success-with-no-effect shape as TRI-349's ``auth reset``, found
+    by the read-back verification added for it.
+
+    The cause must be named accurately: blaming a concurrent gateway here
+    would send the operator to restart a process that has nothing to do with
+    it. Nothing is holding the file — the write landed exactly where it was
+    aimed, and a profile simply cannot express "absent" for a global entry.
+    """
+    from agent.credential_pool import CredentialPoolWriteNotApplied, load_pool
+
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(
+            pool={
+                "openrouter": [
+                    {
+                        "id": "g-1",
+                        "label": "global-key",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                    }
+                ]
+            }
+        ),
+    )
+
+    pool = load_pool("openrouter")
+    assert [entry.id for entry in pool.entries()] == ["g-1"]
+
+    with pytest.raises(CredentialPoolWriteNotApplied) as excinfo:
+        pool.remove_index(1)
+
+    message = str(excinfo.value)
+    assert "still in auth.json" in message
+    assert "authenticated at the global root" in message
+    assert str(profile_env["global"]) in message
+    # The wrong cause must NOT be offered.
+    assert "gateway" not in message.lower()
+    # And the claim is true: the credential really is still readable.
+    assert [entry.id for entry in load_pool("openrouter").entries()] == ["g-1"]

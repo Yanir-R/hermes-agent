@@ -840,3 +840,83 @@ def test_auth_remove_env_seeded_dotenv_with_bom_no_shell_hint(tmp_path, monkeypa
     out = capsys.readouterr().out
     assert "Cleared DEEPSEEK_API_KEY from .env" in out
     assert "still set in your shell environment" not in out
+
+
+# ===========================================================================
+# TRI-349 — `hermes auth reset` must not print success over a failed write
+# ===========================================================================
+
+
+def _codex_exhausted_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _codex_pool_only_store(exhausted=True))
+    return tmp_path / "hermes" / "auth.json"
+
+
+def test_auth_reset_command_clears_the_cooldown_on_disk(
+    tmp_path, monkeypatch, capsys
+):
+    """The success line must describe auth.json, not the in-memory pass.
+
+    Reproduces TRI-349 end-to-end at the command the operator actually runs:
+    before the fix this printed "Reset status on 1 openai-codex credentials"
+    and left ``last_status=exhausted`` in the file.
+    """
+    from hermes_cli.auth_commands import auth_reset_command
+
+    auth_path = _codex_exhausted_home(tmp_path, monkeypatch)
+
+    class _Args:
+        provider = "openai-codex"
+
+    auth_reset_command(_Args())
+
+    out = capsys.readouterr().out
+    assert "Reset status on 1 openai-codex credentials" in out
+    entry = json.loads(auth_path.read_text())["credential_pool"]["openai-codex"][0]
+    assert entry["last_status"] is None
+    assert entry["last_error_reset_at"] is None
+
+
+def test_auth_reset_command_exits_nonzero_when_the_write_does_not_land(
+    tmp_path, monkeypatch, capsys
+):
+    """A repair command that could not repair must not look like one that did.
+
+    A concurrent holder of the same pool — the gateway is one — rewrites its
+    own snapshot over ours. The operator must get a non-zero exit and a line
+    telling them what to do, NOT a success count that costs them their one
+    idea for fixing the problem.
+    """
+    import agent.credential_pool as cp
+    from hermes_cli.auth_commands import auth_reset_command
+
+    auth_path = _codex_exhausted_home(tmp_path, monkeypatch)
+    real_write = cp.write_credential_pool
+    stale = [dict(p) for p in cp.read_credential_pool("openai-codex")]
+    state = {"calls": 0}
+
+    def _with_concurrent_holder(provider_id, entries, **kwargs):
+        result = real_write(provider_id, entries, **kwargs)
+        if provider_id == "openai-codex" and not state["calls"]:
+            state["calls"] += 1
+            real_write("openai-codex", stale)
+        return result
+
+    monkeypatch.setattr(cp, "write_credential_pool", _with_concurrent_holder)
+
+    class _Args:
+        provider = "openai-codex"
+
+    with pytest.raises(SystemExit) as excinfo:
+        auth_reset_command(_Args())
+
+    message = str(excinfo.value)
+    assert "hermes auth reset openai-codex" in message
+    assert "did not take effect" in message
+    assert "Nothing was changed" in message
+    # No success line anywhere in stdout — that is the whole point.
+    assert "Reset status on" not in capsys.readouterr().out
+    # And the claim is accurate: the cooldown really did survive.
+    entry = json.loads(auth_path.read_text())["credential_pool"]["openai-codex"][0]
+    assert entry["last_status"] == "exhausted"

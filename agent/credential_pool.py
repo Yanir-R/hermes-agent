@@ -32,6 +32,7 @@ from hermes_cli.auth import (
     _load_auth_store,
     _load_provider_state,
     _load_provider_state_with_source,
+    _POOL_STATUS_FIELDS,
     _resolve_kimi_base_url,
     _resolve_zai_base_url,
     _same_path,
@@ -592,6 +593,15 @@ def credential_pool_matches_provider(
 DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
 
 
+class CredentialPoolWriteNotApplied(RuntimeError):
+    """A pool mutation was written but is not on disk when read back.
+
+    Raised instead of returning a count, so the caller cannot mistake an
+    undone write for a completed one. The message names the operation, what
+    is actually on disk, and what the operator can do about it.
+    """
+
+
 def _write_through_provider_state_to_global_root(
     provider_id: str, state: Dict[str, Any]
 ) -> None:
@@ -774,7 +784,12 @@ class CredentialPool:
                     self._entries[idx] = new
                     return
 
-    def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+    def _persist(
+        self,
+        *,
+        removed_ids: Optional[List[str]] = None,
+        cleared_status_ids: Optional[List[str]] = None,
+    ) -> None:
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
         with self._lock:
@@ -782,7 +797,114 @@ class CredentialPool:
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=removed_ids,
+                cleared_status_ids=cleared_status_ids,
             )
+
+    # ------------------------------------------------------------------
+    # Write verification (TRI-349)
+    #
+    # Every operator-facing mutator below (reset / add / remove) used to
+    # report a count taken from its own in-memory pass. That count states
+    # the caller's INTENT, not the contents of auth.json: the write goes
+    # through ``write_credential_pool``, which re-reads the file under the
+    # lock and merges on-disk state back over the snapshot, and it can also
+    # be overwritten by any other process holding the same pool. A mutator
+    # that reports success without reading back is therefore unable to tell
+    # "done" from "silently undone" — and the operator is told it worked.
+    # ------------------------------------------------------------------
+
+    def _disk_entries_by_id(self) -> Dict[str, Dict[str, Any]]:
+        """Re-read this provider's pool from auth.json, keyed by entry id.
+
+        Reads through ``read_credential_pool`` — the same function
+        ``load_pool`` uses — so what this returns is exactly what the next
+        reader of the store will see, profile/global fallback included.
+        """
+        disk: Dict[str, Dict[str, Any]] = {}
+        for payload in read_credential_pool(self.provider) or ():
+            if isinstance(payload, dict) and payload.get("id"):
+                disk[str(payload["id"])] = payload
+        return disk
+
+    def _own_store_pool_ids(self) -> Set[str]:
+        """Ids in THIS process's own store slice — where writes actually go.
+
+        ``write_credential_pool`` always targets the active store;
+        ``read_credential_pool`` may additionally fall back to the global
+        root. Comparing the two separates "my write never landed" from "my
+        write landed but something else is still visible through it".
+        """
+        ids: Set[str] = set()
+        try:
+            pool = _load_auth_store().get("credential_pool")
+            entries = pool.get(self.provider) if isinstance(pool, dict) else None
+            for payload in entries or ():
+                if isinstance(payload, dict) and payload.get("id"):
+                    ids.add(str(payload["id"]))
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return ids
+
+    def _global_fallback_hint(self) -> Optional[str]:
+        """Message for a write that landed but is shadowed by the global root.
+
+        A profile whose pool slice for this provider ends up EMPTY falls back
+        to reading the global-root auth.json, so removing the last
+        profile-visible credential writes ``[]`` and the next reader gets the
+        global entry straight back. The write is not lost — it simply cannot
+        express "not present" for a credential the profile never owned.
+        Returns ``None`` when this process is not in profile mode.
+        """
+        try:
+            global_path = _global_auth_file_path()
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if global_path is None:
+            return None
+        return (
+            f"This credential is authenticated at the global root "
+            f"({global_path.parent}), not in the active profile, and a profile "
+            f"can only shadow the global pool — never empty it. Re-run this "
+            f"command against the global root "
+            f"(HERMES_HOME={global_path.parent}) to change it there."
+        )
+
+    def _concurrent_holder_hint(self) -> str:
+        """Best-effort note about who else may be holding this pool.
+
+        Never asserts that the named process IS the overwriting party — it
+        reports what is running so the operator has somewhere to look. A
+        missing or unreadable pid file degrades to the generic line.
+        """
+        pid = None
+        try:  # pragma: no cover - depends on host process state
+            from gateway.status import get_running_pid
+
+            pid = get_running_pid()
+        except Exception:
+            pid = None
+        if pid:
+            return (
+                f"The Hermes gateway is running (pid {pid}) and holds this pool "
+                f"in memory. Stop it (`hermes gateway stop`), re-run this "
+                f"command, then start it again — or restart it with "
+                f"`hermes gateway run --replace`, which reloads the pool from disk."
+            )
+        return (
+            "Another process is writing the same auth.json. Stop whatever else "
+            "is running Hermes (`hermes gateway status` lists gateway processes) "
+            "and re-run this command."
+        )
+
+    def _raise_not_applied(
+        self, action: str, detail: str, *, cause: Optional[str] = None
+    ) -> None:
+        raise CredentialPoolWriteNotApplied(
+            f"{action} did not take effect: {detail}\n"
+            f"auth.json was rewritten, but the change is not in it on re-read. "
+            f"Nothing was changed.\n"
+            f"{cause or self._concurrent_holder_hint()}"
+        )
 
     def _is_terminal_auth_failure(
         self,
@@ -2329,8 +2451,16 @@ class CredentialPool:
         return refreshed
 
     def reset_statuses(self) -> int:
+        """Clear status/cooldown fields on every dirty entry.
+
+        Returns the number of entries cleared **on disk**, verified by
+        re-reading auth.json after the write. Raises
+        ``CredentialPoolWriteNotApplied`` if any entry it cleared still
+        carries a status after the write, rather than reporting a count that
+        only describes the in-memory pass (TRI-349).
+        """
         with self._lock:
-            count = 0
+            cleared_ids: List[str] = []
             new_entries = []
             for entry in self._entries:
                 if entry.last_status or entry.last_status_at or entry.last_error_code:
@@ -2345,15 +2475,51 @@ class CredentialPool:
                             last_error_reset_at=None,
                         )
                     )
-                    count += 1
+                    cleared_ids.append(entry.id)
                 else:
                     new_entries.append(entry)
-            if count:
-                self._entries = new_entries
-                self._persist()
-            return count
+            if not cleared_ids:
+                return 0
+            self._entries = new_entries
+            self._persist(cleared_status_ids=cleared_ids)
+
+            # Read back. A count from the loop above is a statement about
+            # this process's intent; only the file says whether it happened.
+            disk = self._disk_entries_by_id()
+            still_dirty = []
+            for entry_id in cleared_ids:
+                payload = disk.get(entry_id)
+                if payload is None:
+                    # The entry vanished from the store entirely — the reset
+                    # cannot be said to have landed on it.
+                    still_dirty.append((entry_id, "no longer in the store"))
+                    continue
+                if any(payload.get(field) for field in _POOL_STATUS_FIELDS):
+                    still_dirty.append(
+                        (entry_id, f"still {payload.get('last_status') or 'dirty'}")
+                    )
+            if still_dirty:
+                label_by_id = {entry.id: entry.label for entry in self._entries}
+                detail = "; ".join(
+                    f"{label_by_id.get(eid) or eid[:8]} {why}"
+                    for eid, why in still_dirty
+                )
+                self._raise_not_applied(
+                    f"reset of {len(still_dirty)} of {len(cleared_ids)} "
+                    f"{self.provider} credential(s)",
+                    detail,
+                )
+            return len(cleared_ids)
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
+        """Remove the entry at 1-based *index*, verified against disk.
+
+        Raises ``CredentialPoolWriteNotApplied`` if the entry is still in
+        auth.json after the write — same contract as ``reset_statuses``
+        (TRI-349). ``removed_ids`` already stops ``write_credential_pool``'s
+        own merge from resurrecting it, so this fires only for a genuine
+        concurrent writer, which is exactly the case the operator needs told.
+        """
         with self._lock:
             if index < 1 or index > len(self._entries):
                 return None
@@ -2369,6 +2535,23 @@ class CredentialPool:
             )
             if self._current_id == removed.id:
                 self._current_id = None
+            if removed.id in self._disk_entries_by_id():
+                # Separate the two causes before naming one. If the entry is
+                # gone from OUR store but still readable, the write landed and
+                # the global-root fallback is showing it through — telling the
+                # operator to stop the gateway would send them after the wrong
+                # thing entirely.
+                cause = (
+                    self._global_fallback_hint()
+                    if removed.id not in self._own_store_pool_ids()
+                    else None
+                )
+                self._raise_not_applied(
+                    f"removal of {self.provider} credential "
+                    f"#{index} ({removed.label})",
+                    "it is still in auth.json",
+                    cause=cause,
+                )
             return removed
 
     def resolve_target(self, target: Any) -> Tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
@@ -2398,10 +2581,24 @@ class CredentialPool:
             return None, None, f'No credential matching "{raw}".'
 
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
+        """Append *entry* to the pool, verified against disk.
+
+        Raises ``CredentialPoolWriteNotApplied`` if the entry is not in
+        auth.json after the write — same contract as ``reset_statuses``
+        (TRI-349). A credential the operator was told was added, but which no
+        process can read, is the same failure shape as a reset that did not
+        land: it costs them the one action they took.
+        """
         with self._lock:
             entry = replace(entry, priority=_next_priority(self._entries))
             self._entries.append(entry)
             self._persist()
+            if entry.id not in self._disk_entries_by_id():
+                self._raise_not_applied(
+                    f"add of {self.provider} credential "
+                    f"\"{entry.label}\"",
+                    "it is not in auth.json",
+                )
             return entry
 
 

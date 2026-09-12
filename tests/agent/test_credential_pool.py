@@ -2079,3 +2079,269 @@ class TestCredentialPoolQueryLocking:
             inner.release()
 
         assert done.wait(timeout=2.0), f"{method}() did not complete after lock release"
+
+
+# ===========================================================================
+# TRI-349 — pool mutators must report what is on disk, not what they intended
+# ===========================================================================
+
+
+def _exhausted_pool_store(tmp_path, monkeypatch, *, reset_in: float = 3 * 86400):
+    """auth.json holding one openai-codex entry under a live cooldown.
+
+    Mirrors the shape observed in the field: ``last_status=exhausted`` with a
+    ``last_error_reset_at`` days in the future, which is what made the cooldown
+    "still binding" and therefore eligible for resurrection by the merge in
+    ``write_credential_pool``.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time() - 3600,
+                        "last_error_code": 429,
+                        "last_error_reason": "usage_limit_reached",
+                        "last_error_message": "rate limited",
+                        "last_error_reset_at": time.time() + reset_in,
+                    }
+                ]
+            },
+        },
+    )
+    return tmp_path / "hermes" / "auth.json"
+
+
+def _disk_pool(auth_path, provider="openai-codex"):
+    return json.loads(auth_path.read_text())["credential_pool"][provider]
+
+
+class _ConcurrentHolder:
+    """A second in-memory holder of the same pool, as the gateway is.
+
+    Installed over ``agent.credential_pool.write_credential_pool`` so that the
+    instant the credential under test writes auth.json, the holder persists its
+    OWN (pre-mutation) snapshot on top — two writers, one file. This is what
+    nothing in the suite exercised before TRI-349, which is why a mutator that
+    reported success without reading back could ship.
+    """
+
+    def __init__(self, monkeypatch, provider="openai-codex"):
+        import agent.credential_pool as cp
+
+        self.provider = provider
+        self.calls = 0
+        self._cp = cp
+        self._real_write = cp.write_credential_pool
+        # Snapshot of the store as it stands BEFORE the command under test
+        # mutates it — this is the holder's stale in-memory view.
+        self._stale = [dict(payload) for payload in cp.read_credential_pool(provider)]
+        monkeypatch.setattr(cp, "write_credential_pool", self._write)
+
+    def _write(self, provider_id, entries, **kwargs):
+        result = self._real_write(provider_id, entries, **kwargs)
+        if provider_id != self.provider or self.calls:
+            return result
+        self.calls += 1
+        # The holder rewrites its stale snapshot, unaware of our change. It
+        # passes no ``cleared_status_ids``/``removed_ids`` because it is not
+        # resetting or removing anything — it is just persisting what it has.
+        self._real_write(self.provider, self._stale)
+        return result
+
+
+class TestPoolMutatorsVerifyTheirWrites:
+    """``reset``/``add``/``remove`` must not report a change they did not make.
+
+    Before TRI-349 each returned a count taken from its own in-memory pass and
+    never re-read the store, so ``hermes auth reset openai-codex`` printed
+    "Reset status on 1 openai-codex credentials", moved auth.json's mtime, and
+    left ``last_status=exhausted`` in the file — telling the operator their one
+    repair had been applied when it had not.
+    """
+
+    def test_reset_statuses_clears_the_cooldown_on_disk(self, tmp_path, monkeypatch):
+        """The reset must survive ``write_credential_pool``'s own merge.
+
+        No second writer, no threads, no race: a single process. The merge
+        cannot distinguish a deliberate reset (status fields cleared on
+        purpose) from a stale snapshot (status fields never seen), and a
+        cleared entry always loses the ``last_status_at`` recency comparison
+        against a live on-disk cooldown, so the reset was handed straight
+        back. Asserting on the FILE is the point — the in-memory entry was
+        always correct, which is exactly why the defect was invisible.
+        """
+        from agent.credential_pool import load_pool
+
+        auth_path = _exhausted_pool_store(tmp_path, monkeypatch)
+        pool = load_pool("openai-codex")
+
+        count = pool.reset_statuses()
+
+        assert count == 1
+        entry = next(e for e in _disk_pool(auth_path) if e["id"] == "cred-1")
+        assert entry["last_status"] is None
+        assert entry["last_status_at"] is None
+        assert entry["last_error_code"] is None
+        assert entry["last_error_reason"] is None
+        assert entry["last_error_message"] is None
+        assert entry["last_error_reset_at"] is None
+
+    def test_reset_statuses_returns_zero_when_nothing_is_dirty(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.credential_pool import load_pool
+
+        auth_path = _exhausted_pool_store(tmp_path, monkeypatch)
+        pool = load_pool("openai-codex")
+        assert pool.reset_statuses() == 1
+        # Second reset has nothing to do and must not claim otherwise.
+        assert load_pool("openai-codex").reset_statuses() == 0
+        assert _disk_pool(auth_path)[0]["last_status"] is None
+
+    def test_reset_statuses_refuses_when_a_concurrent_holder_overwrites(
+        self, tmp_path, monkeypatch
+    ):
+        """A write that cannot take effect must say so, not print a count."""
+        from agent.credential_pool import (
+            CredentialPoolWriteNotApplied,
+            load_pool,
+        )
+
+        auth_path = _exhausted_pool_store(tmp_path, monkeypatch)
+        pool = load_pool("openai-codex")
+        holder = _ConcurrentHolder(monkeypatch)
+
+        with pytest.raises(CredentialPoolWriteNotApplied) as excinfo:
+            pool.reset_statuses()
+
+        assert holder.calls == 1
+        message = str(excinfo.value)
+        # The operator must learn three things: it failed, nothing changed,
+        # and what to do next. A bare exception type is not a usable answer.
+        assert "did not take effect" in message
+        assert "Nothing was changed" in message
+        assert "re-run this command" in message
+        # And the message must be true: the cooldown really is still there.
+        assert _disk_pool(auth_path)[0]["last_status"] == "exhausted"
+
+    def test_add_entry_survives_a_concurrent_holder(self, tmp_path, monkeypatch):
+        """A concurrent holder cannot drop a freshly added credential.
+
+        ``write_credential_pool`` merges entries present on disk but absent
+        from the writer's snapshot, so the holder's stale rewrite carries the
+        new credential forward rather than erasing it. Recorded as a test
+        because it is the reason ``auth add`` does NOT share reset's defect,
+        and a future change to that merge would silently take it away.
+        """
+        from dataclasses import replace as dc_replace
+
+        from agent.credential_pool import load_pool
+
+        auth_path = _exhausted_pool_store(tmp_path, monkeypatch)
+        pool = load_pool("openai-codex")
+        new_entry = dc_replace(pool.entries()[0], id="cred-new", label="second-key")
+        holder = _ConcurrentHolder(monkeypatch)
+
+        added = pool.add_entry(new_entry)
+
+        assert holder.calls == 1
+        assert added.id == "cred-new"
+        assert "cred-new" in {e["id"] for e in _disk_pool(auth_path)}
+
+    def test_add_entry_refuses_when_the_credential_does_not_reach_disk(
+        self, tmp_path, monkeypatch
+    ):
+        """``add_entry`` must read back rather than trust its own append.
+
+        The loss is injected at the write boundary rather than modelled as a
+        specific rival process: what is under test is that ``add_entry``
+        NOTICES a credential that is not in the store, whatever ate it. Before
+        TRI-349 it returned the entry and the CLI printed ``Added ...`` with no
+        read-back at all, so any loss path at or below ``write_credential_pool``
+        surfaced to the operator as a success.
+        """
+        import agent.credential_pool as cp
+        from dataclasses import replace as dc_replace
+
+        from agent.credential_pool import (
+            CredentialPoolWriteNotApplied,
+            load_pool,
+        )
+
+        auth_path = _exhausted_pool_store(tmp_path, monkeypatch)
+        pool = load_pool("openai-codex")
+        new_entry = dc_replace(pool.entries()[0], id="cred-new", label="second-key")
+
+        real_write = cp.write_credential_pool
+
+        def _drops_the_new_entry(provider_id, entries, **kwargs):
+            kept = [e for e in entries if e.get("id") != "cred-new"]
+            return real_write(provider_id, kept, **kwargs)
+
+        monkeypatch.setattr(cp, "write_credential_pool", _drops_the_new_entry)
+
+        with pytest.raises(CredentialPoolWriteNotApplied) as excinfo:
+            pool.add_entry(new_entry)
+
+        assert "not in auth.json" in str(excinfo.value)
+        assert "second-key" in str(excinfo.value)
+        assert {e["id"] for e in _disk_pool(auth_path)} == {"cred-1"}
+
+    def test_remove_index_refuses_when_the_credential_survives_on_disk(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.credential_pool import (
+            CredentialPoolWriteNotApplied,
+            load_pool,
+        )
+
+        auth_path = _exhausted_pool_store(tmp_path, monkeypatch)
+        pool = load_pool("openai-codex")
+        _ConcurrentHolder(monkeypatch)
+
+        with pytest.raises(CredentialPoolWriteNotApplied) as excinfo:
+            pool.remove_index(1)
+
+        assert "still in auth.json" in str(excinfo.value)
+        assert {e["id"] for e in _disk_pool(auth_path)} == {"cred-1"}
+
+    def test_add_and_remove_land_on_disk_with_no_concurrent_holder(
+        self, tmp_path, monkeypatch
+    ):
+        """add/remove do NOT share reset's single-process defect.
+
+        ``write_credential_pool``'s merge only resurrects STATUS fields of an
+        entry present on both sides. ``add_entry`` always carries a fresh id
+        (no on-disk counterpart to merge from) and ``remove_index`` already
+        passes ``removed_ids`` to suppress resurrection, so neither is undone
+        by the write path itself. They shared only the reporting contract —
+        a success returned without reading back — which the verification above
+        closes for all three.
+        """
+        from dataclasses import replace as dc_replace
+
+        from agent.credential_pool import load_pool
+
+        auth_path = _exhausted_pool_store(tmp_path, monkeypatch)
+        pool = load_pool("openai-codex")
+
+        added = pool.add_entry(
+            dc_replace(pool.entries()[0], id="cred-new", label="second-key")
+        )
+        assert added.id == "cred-new"
+        assert "cred-new" in {e["id"] for e in _disk_pool(auth_path)}
+
+        removed = pool.remove_index(1)
+        assert removed is not None
+        assert removed.id not in {e["id"] for e in _disk_pool(auth_path)}

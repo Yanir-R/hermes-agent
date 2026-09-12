@@ -1717,6 +1717,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    cleared_status_ids: Optional[Iterable[str]] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1735,8 +1736,20 @@ def write_credential_pool(
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
+
+    Pass ``cleared_status_ids`` for entries whose status fields the caller
+    DELIBERATELY cleared (``hermes auth reset``), so the cooldown merge does
+    not resurrect them either.  Without this the merge cannot tell a stale
+    snapshot ("I never saw the cooldown") from an explicit reset ("clear the
+    cooldown"): both arrive as ``last_status=None`` with ``last_status_at=None``,
+    which always loses the recency comparison against a live on-disk cooldown.
+    ``hermes auth reset`` therefore rewrote auth.json — moving its mtime — and
+    handed the operator's own reset straight back to them unchanged, in a single
+    process, with no second writer involved (TRI-349).  This is the same
+    "the caller meant it" escape hatch ``removed_ids`` already provides.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
+    status_cleared = {cid for cid in (cleared_status_ids or ()) if cid}
     with _auth_store_lock():
         auth_store = _load_auth_store()
         pool = auth_store.get("credential_pool")
@@ -1762,7 +1775,11 @@ def write_credential_pool(
         }
         merged: List[Dict[str, Any]] = [
             _merge_disk_cooldown_state(
-                entry, existing_by_id.get(entry.get("id")), provider_id
+                entry,
+                None
+                if entry.get("id") in status_cleared
+                else existing_by_id.get(entry.get("id")),
+                provider_id,
             )
             if isinstance(entry, dict)
             else entry

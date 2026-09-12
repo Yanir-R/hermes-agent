@@ -12,6 +12,7 @@ from agent.credential_pool import (
     AUTH_TYPE_API_KEY,
     AUTH_TYPE_OAUTH,
     CUSTOM_POOL_PREFIX,
+    CredentialPoolWriteNotApplied,
     SOURCE_MANUAL,
     SOURCE_MANUAL_DEVICE_CODE,
     STATUS_EXHAUSTED,
@@ -162,6 +163,18 @@ def _format_exhausted_status(entry) -> str:
 
 
 def auth_add_command(args) -> None:
+    # Every ``pool.add_entry`` below verifies the credential reached disk and
+    # raises when it did not, so none of the "Added ..." lines can be printed
+    # about a credential the next reader will not see (TRI-349). Wrapped once
+    # here because the provider branches add from six different places.
+    try:
+        _auth_add_command(args)
+    except CredentialPoolWriteNotApplied as exc:
+        provider = _normalize_provider(getattr(args, "provider", ""))
+        raise SystemExit(f"hermes auth add {provider}: {exc}")
+
+
+def _auth_add_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
     if provider not in PROVIDER_REGISTRY and provider != "openrouter" and not provider.startswith(CUSTOM_POOL_PREFIX):
         raise SystemExit(f"Unknown provider: {provider}")
@@ -470,7 +483,10 @@ def auth_remove_command(args) -> None:
     index, matched, error = pool.resolve_target(target)
     if matched is None or index is None:
         raise SystemExit(f"{error} Provider: {provider}.")
-    removed = pool.remove_index(index)
+    try:
+        removed = pool.remove_index(index)
+    except CredentialPoolWriteNotApplied as exc:
+        raise SystemExit(f"hermes auth remove {provider}: {exc}")
     if removed is None:
         raise SystemExit(f'No credential matching "{target}" for provider {provider}.')
     print(f"Removed {provider} credential #{index} ({removed.label})")
@@ -502,7 +518,14 @@ def auth_remove_command(args) -> None:
 def auth_reset_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
     pool = load_pool(provider)
-    count = pool.reset_statuses()
+    # ``reset_statuses`` re-reads auth.json and raises when the reset is not
+    # in it, so the success line below is only ever printed about a change
+    # that is actually on disk (TRI-349). Exit non-zero on failure: a repair
+    # command that could not repair must not look like one that did.
+    try:
+        count = pool.reset_statuses()
+    except CredentialPoolWriteNotApplied as exc:
+        raise SystemExit(f"hermes auth reset {provider}: {exc}")
     print(f"Reset status on {count} {provider} credentials")
 
 
