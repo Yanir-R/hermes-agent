@@ -20520,6 +20520,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Suppressing intentional silence marker for session %s",
                     session_entry.session_id,
                 )
+                if isinstance(getattr(event, "metadata", None), dict):
+                    # Adapter lifecycle hooks run after the response returns to
+                    # BasePlatformAdapter. Preserve the delivery decision on
+                    # this event so a platform can acknowledge intentional
+                    # silence without exposing the control token itself.
+                    event.metadata["gateway_intentional_silence"] = True
                 response = ""
 
             # Auto voice reply: send TTS audio before the text response

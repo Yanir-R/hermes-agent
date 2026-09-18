@@ -1,5 +1,7 @@
 """Gateway intentional-silence token behavior."""
 
+import asyncio
+
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -92,9 +94,9 @@ def test_failed_agent_result_never_counts_as_intentional_silence():
     assert not is_intentional_silence_agent_result({"failed": True}, "NO_REPLY")
 
 
-@pytest.mark.asyncio
-async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkeypatch, tmp_path):
+def test_silence_token_suppresses_delivery_but_preserves_transcript(monkeypatch, tmp_path):
     runner = _runner(monkeypatch, tmp_path)
+    event = _event()
     runner._run_agent = AsyncMock(return_value={
         "final_response": "[SILENT]",
         "messages": [
@@ -108,11 +110,14 @@ async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkey
         "failed": False,
     })
 
-    response = await runner._handle_message_with_agent(
-        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    response = asyncio.run(
+        runner._handle_message_with_agent(
+            event, _source(), "agent:main:telegram:group:-1001:12345", 1
+        )
     )
 
     assert response == ""
+    assert event.metadata["gateway_intentional_silence"] is True
     appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
     assert {"role": "assistant", "content": "[SILENT]"}.items() <= appended[-1].items()
     assert [msg["role"] for msg in appended if msg.get("role") in {"user", "assistant"}] == ["user", "assistant"]
