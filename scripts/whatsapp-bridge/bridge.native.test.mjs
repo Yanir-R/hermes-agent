@@ -14,6 +14,7 @@ import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 
 import {
   buildPollPayload,
+  buildReactionPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
   appendMediaFailureNote,
@@ -23,6 +24,26 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+// -- outbound reactions ---------------------------------------------------
+{
+  const groupKey = {
+    id: 'incoming-group-1',
+    remoteJid: '120363001234567890@g.us',
+    participant: '15550001111@s.whatsapp.net',
+    fromMe: false,
+  };
+  const built = buildReactionPayload({ key: groupKey, emoji: '👀' });
+  assert.equal(built.chatId, groupKey.remoteJid);
+  assert.deepEqual(built.payload, {
+    react: { text: '👀', key: groupKey },
+  });
+  assert.throws(
+    () => buildReactionPayload({ key: { ...groupKey, fromMe: true }, emoji: '👀' }),
+    /inbound message/,
+  );
+  console.log('  ✓ outbound reactions preserve the exact inbound group key');
+}
 
 // -- inbound read receipts ------------------------------------------------
 {

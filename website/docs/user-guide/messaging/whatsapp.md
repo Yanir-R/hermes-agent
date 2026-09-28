@@ -238,6 +238,26 @@ gateway:
 
 Set `text_batch_delay_seconds: 0` to dispatch each message immediately (disables batching).
 
+### Selective Response Groups
+
+For a small private group where Hermes should follow the conversation without
+requiring an explicit mention, list the exact group JID in `config.yaml`:
+
+```yaml
+whatsapp:
+  require_mention: true
+  selective_response_chats:
+    - "120363001234567890@g.us"
+```
+
+Only those exact group JIDs bypass the mention gate, and they must still pass
+the normal WhatsApp group policy and sender authorization checks. Each accepted
+message runs through that group's normal isolated session. Hermes replies when
+the message calls for assistance; when no response is useful, it emits the
+internal `NO_REPLY` control result and the adapter acknowledges the inbound
+message with 👀 instead of sending text. DMs and groups not listed here keep
+their existing behavior.
+
 ---
 
 ## Troubleshooting

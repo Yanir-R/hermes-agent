@@ -506,6 +506,26 @@ export function inboundReadReceiptKeys({ key, enabled }) {
   return [key];
 }
 
+export function buildReactionPayload({ key, emoji }) {
+  if (!key || typeof key !== 'object' || Array.isArray(key)) {
+    throw new Error('key is required');
+  }
+  const id = String(key.id || '').trim();
+  const remoteJid = normalizeWhatsAppId(key.remoteJid || '');
+  const text = String(emoji || '').trim();
+  if (!id || !remoteJid) throw new Error('key.id and key.remoteJid are required');
+  if (key.fromMe === true) throw new Error('reaction target must be an inbound message');
+  if (!text || text.length > 16) throw new Error('emoji is required and must be at most 16 characters');
+
+  const reactionKey = { id, remoteJid, fromMe: false };
+  const participant = normalizeWhatsAppId(key.participant || '');
+  if (participant) reactionKey.participant = participant;
+  return {
+    chatId: remoteJid,
+    payload: { react: { text, key: reactionKey } },
+  };
+}
+
 export function mediaPayloadForFile({ buffer, filePath, mediaType, caption, fileName }) {
   const ext = filePath.toLowerCase().split('.').pop();
   const type = mediaType || inferMediaType(ext);

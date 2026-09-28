@@ -11,6 +11,7 @@
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
+ *   POST /react          - React to an inbound message { key, emoji }
  *   POST /typing         - Send typing indicator { chatId }
  *   GET  /chat/:id       - Get chat info
  *   GET  /health         - Health check
@@ -35,6 +36,7 @@ import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
   buildPollPayload,
+  buildReactionPayload,
   createReconnectScheduler,
   createVersionResolver,
   buildLocationPayload,
@@ -1075,6 +1077,25 @@ app.post('/read', async (req, res) => {
   } catch (err) {
     console.warn('[bridge] failed to send read receipt:', err.message);
     return res.status(500).json({ error: 'Failed to send read receipt' });
+  }
+});
+
+// React to an exact inbound message. The Python adapter forwards the original
+// Baileys key so group participant routing is preserved.
+app.post('/react', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected' });
+  }
+
+  try {
+    const { chatId, payload } = buildReactionPayload({
+      key: req.body?.key,
+      emoji: req.body?.emoji,
+    });
+    await sendWithTimeout(chatId, payload);
+    return res.json({ success: true });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
   }
 });
 

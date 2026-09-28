@@ -290,6 +290,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
     cache_image_from_url,
@@ -401,6 +402,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     - group_policy: "open" | "allowlist" | "disabled" | "pairing" — which groups are processed (default: "pairing")
     - group_allow_from: List of group JIDs allowed (when group_policy="allowlist")
     - send_read_receipts: Mark accepted inbound WhatsApp messages as read
+    - selective_response_chats: Exact group JIDs where every message reaches
+      the agent, which may answer or return NO_REPLY for a private 👀 ack
 
     Behavior (gating, mention parsing, markdown conversion, chunking) is
     provided by ``WhatsAppBehaviorMixin`` so the Cloud API adapter can
@@ -486,6 +489,50 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+
+    def _whatsapp_selective_response_chats(self) -> set[str]:
+        """Exact group JIDs that use model-selected reply-or-ack behavior."""
+        return self._coerce_allow_list(
+            self.config.extra.get("selective_response_chats")
+        )
+
+    def _is_selective_response_message(self, data: Dict[str, Any]) -> bool:
+        """Return True only for an explicitly configured, authorized group.
+
+        This is deliberately narrower than ``free_response_chats``: a target
+        must be a real group, pass the existing group policy, and match an
+        exact configured JID. DMs and every other group retain their existing
+        mention gate.
+        """
+        if not data.get("isGroup", False) or data.get("fromOwner"):
+            return False
+        chat_id = str(data.get("chatId") or "")
+        if not chat_id or self._is_broadcast_chat(chat_id):
+            return False
+        if chat_id not in self._whatsapp_selective_response_chats():
+            return False
+        if not self._is_group_allowed(chat_id):
+            return False
+
+        # Selective groups bypass the normal mention gate before the gateway's
+        # authorization stage. Fail closed here unless the runner-bound auth
+        # callback confirms the sender, so an unapproved participant cannot
+        # consume model tokens or enter this group's transcript.
+        sender_id = str(data.get("senderId") or data.get("from") or "")
+        return self._is_sender_authorized(sender_id, "group", chat_id) is True
+
+    @staticmethod
+    def _selective_response_channel_prompt() -> str:
+        return (
+            "You are the shared assistant in a private WhatsApp leadership group.\n"
+            "- Every new group message is shown to you so you can maintain the group's context.\n"
+            "- Reply when someone asks you a question, gives you a task, addresses you implicitly, "
+            "or when a concise intervention is clearly useful.\n"
+            "- If the message is ordinary conversation between the humans and no assistant response "
+            "is useful, output exactly NO_REPLY and nothing else. The gateway will acknowledge it "
+            "with an eyes reaction.\n"
+            "- Never reveal information from another profile, DM, group, or session."
+        )
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -1388,6 +1435,45 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] WhatsApp read receipt failed: %s", self.name, exc)
 
+    async def _send_reaction_key(self, key: Dict[str, Any], emoji: str) -> bool:
+        """React to one inbound message using its original Baileys key."""
+        if not self._http_session or not isinstance(key, dict):
+            return False
+        try:
+            import aiohttp
+
+            async with self._http_session.post(
+                f"http://127.0.0.1:{self._bridge_port}/react",
+                json={"key": key, "emoji": emoji},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 200:
+                    return True
+                logger.warning(
+                    "[%s] WhatsApp reaction failed with HTTP %s",
+                    self.name,
+                    resp.status,
+                )
+        except Exception as exc:
+            logger.warning("[%s] WhatsApp reaction failed: %s", self.name, exc)
+        return False
+
+    async def on_processing_complete(
+        self, event: MessageEvent, outcome: ProcessingOutcome
+    ) -> None:
+        """Acknowledge intentional silence in selective groups with 👀 only."""
+        metadata = event.metadata if isinstance(event.metadata, dict) else {}
+        if (
+            outcome is not ProcessingOutcome.SUCCESS
+            or not metadata.get("whatsapp_selective_response")
+            or not metadata.get("gateway_intentional_silence")
+        ):
+            return
+        keys = metadata.get("whatsapp_reaction_keys") or []
+        for key in keys:
+            if isinstance(key, dict):
+                await self._send_reaction_key(key, "👀")
+
     # ── Text debounce batching ──────────────────────────────────────
 
     _SPLIT_THRESHOLD = 6000  # WhatsApp supports ~65K chars; generous threshold
@@ -1395,9 +1481,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text message batching."""
         from gateway.session import build_session_key
+        # Selective-response groups share one durable group session, but their
+        # debounce lanes remain per sender. Otherwise two leaders typing in
+        # the same five-second window would be concatenated under the first
+        # sender's identity before the routed shared session sees the turn.
+        selective = bool(event.metadata.get("whatsapp_selective_response"))
         return build_session_key(
             event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            group_sessions_per_user=(
+                True
+                if selective
+                else self.config.extra.get("group_sessions_per_user", True)
+            ),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
@@ -1422,6 +1517,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            existing_keys = existing.metadata.setdefault("whatsapp_reaction_keys", [])
+            for reaction_key in event.metadata.get("whatsapp_reaction_keys", []):
+                if reaction_key not in existing_keys:
+                    existing_keys.append(reaction_key)
 
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
@@ -1452,7 +1551,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
-            if not self._should_process_message(data):
+            selective_response = self._is_selective_response_message(data)
+            if not selective_response and not self._should_process_message(data):
                 return None
 
             # Determine message type
@@ -1612,6 +1712,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
             metadata: Dict[str, Any] = {}
+            channel_prompt = None
+            if selective_response:
+                metadata["whatsapp_selective_response"] = True
+                receipt_key = data.get("readReceiptKey")
+                if isinstance(receipt_key, dict) and not receipt_key.get("fromMe"):
+                    metadata["whatsapp_reaction_keys"] = [dict(receipt_key)]
+                channel_prompt = self._selective_response_channel_prompt()
             native_type = str(data.get("nativeType") or "").strip()
             native_metadata = data.get("nativeMetadata")
             if native_type:
@@ -1642,6 +1749,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 media_urls=cached_urls,
                 media_types=media_types,
                 metadata=metadata,
+                channel_prompt=channel_prompt,
                 reply_to_message_id=reply_to_message_id,
                 reply_to_text=reply_to_text,
                 reply_to_author_id=reply_to_author_id,
@@ -1848,9 +1956,11 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
 
     Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy
     whatsapp_cfg block from gateway/config.py::load_gateway_config(). Env vars
-    take precedence over YAML. Returns None — everything flows through env.
+    take precedence over YAML for legacy settings; adapter-only behavior is
+    returned through ``PlatformConfig.extra``.
     """
     import json as _json
+    extras: dict = {}
     if "require_mention" in whatsapp_cfg and not os.getenv("WHATSAPP_REQUIRE_MENTION"):
         os.environ["WHATSAPP_REQUIRE_MENTION"] = str(whatsapp_cfg["require_mention"]).lower()
     if "mention_patterns" in whatsapp_cfg and not os.getenv("WHATSAPP_MENTION_PATTERNS"):
@@ -1874,7 +1984,9 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
         if isinstance(gaf, list):
             gaf = ",".join(str(v) for v in gaf)
         os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
-    return None
+    if "selective_response_chats" in whatsapp_cfg:
+        extras["selective_response_chats"] = whatsapp_cfg["selective_response_chats"]
+    return extras or None
 
 
 def _is_connected(config) -> bool:
