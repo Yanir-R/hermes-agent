@@ -460,6 +460,64 @@ class TestDisabledToolsetsPlatformBundle:
         assert bundle_non_core_tools("hermes-does-not-exist") == set()
 
 
+class TestSkillToolsExcludedFromRestrictedToolset:
+    """TRI-498: a restricted (non-admin) messaging profile's resolved toolset
+    must not expose ``skill_view``/``skills_list``/``skill_manage`` -- those
+    are the only way a model can autonomously (non-slash) load a skill's
+    instructions, including a stale/replaced one like the legacy
+    google-workspace skill. This is the schema-construction gate: a tool
+    absent from ``get_tool_definitions``'s output is never offered to the
+    model, so a well-behaved provider never emits a tool_call for it. (Note:
+    the ``tool_search`` deferred-dispatch bridge is not a second path to
+    check here -- ``is_deferrable_tool_name`` excludes every ``_HERMES_CORE_TOOLS``
+    member, and the skill tools are core tools, so they are never deferrable
+    regardless of toolset; only the schema gate applies to them.)
+    """
+
+    def test_restricted_messaging_toolset_excludes_skill_tools(self):
+        from model_tools import get_tool_definitions
+
+        # Mirrors the live default `platform_toolsets.whatsapp` composition
+        # used by every non-owner profile: web, memory, clarify, stt, todo,
+        # tts, vision (some profiles narrow this further, none widen it to
+        # include the skills toolset).
+        names = {
+            t["function"]["name"]
+            for t in get_tool_definitions(
+                enabled_toolsets=["web", "memory", "clarify", "stt", "todo", "tts", "vision"],
+                quiet_mode=True,
+            )
+        }
+        assert not ({"skill_view", "skills_list", "skill_manage"} & names), (
+            f"Skill tools leaked into a restricted toolset: "
+            f"{{'skill_view', 'skills_list', 'skill_manage'}} & {names}"
+        )
+
+    def test_skill_tools_are_core_never_deferrable(self):
+        """Confirms the tool_search bridge is not a second route to these
+        tools regardless of toolset -- skill_view/skills_list/skill_manage
+        are _HERMES_CORE_TOOLS members, and is_deferrable_tool_name excludes
+        every core tool unconditionally."""
+        from tools.tool_search import is_deferrable_tool_name
+
+        for name in ("skill_view", "skills_list", "skill_manage"):
+            assert not is_deferrable_tool_name(name), (
+                f"{name} became deferrable -- the tool_search bridge scope "
+                "gate would need to cover it too"
+            )
+
+    def test_full_access_toolset_does_grant_skill_tools(self):
+        """Sanity/negative control: the restriction above is toolset-specific,
+        not a global bug that would also hide a false pass in the first test."""
+        from model_tools import get_tool_definitions
+
+        names = {
+            t["function"]["name"]
+            for t in get_tool_definitions(enabled_toolsets=["hermes-cli"], quiet_mode=True)
+        }
+        assert {"skill_view", "skills_list", "skill_manage"} <= names
+
+
 class TestDisabledToolsetsPostureToolset:
     """Regression test for #57315: disabling a posture toolset (`coding`,
     posture: True) must preserve the shared core tools it re-lists but does
