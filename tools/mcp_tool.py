@@ -685,20 +685,38 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     an exception: users configured that backend specifically so Hermes and
     its subprocesses can consume those credentials without duplicating them
     in every MCP server's ``env:`` block.
+
+    Source-tagged names are resolved through the ACTIVE PROFILE's own secret
+    scope (``agent.secret_scope.get_secret``), never read straight from
+    ``os.environ``: the tag map is process-wide (any served profile's
+    hydration tags a name there), while under a multiplexed gateway
+    ``os.environ`` only ever holds the LAUNCH profile's value. Reading it
+    directly would start a routed profile's stdio MCP child with a
+    DIFFERENT profile's 1Password/Bitwarden-sourced credential (TRI-482;
+    fixed upstream at ``580322ef1e``). ``get_secret`` itself falls back to
+    ``os.environ`` when multiplexing is off, so single-profile behavior is
+    unchanged; a profile the tagged source has no value for gets nothing,
+    never another profile's token.
     """
     try:
-        from hermes_cli.env_loader import get_secret_source
+        from hermes_cli.env_loader import secret_source_names
+        from agent.secret_scope import get_secret
     except Exception:  # pragma: no cover — early bootstrap/import fallback
-        get_secret_source = None
+        secret_source_names = None
+        get_secret = None
     env = {}
     for key, value in os.environ.items():
         if (
             key in _SAFE_ENV_KEYS
             or key.upper() in _SAFE_ENV_KEYS_CASE_INSENSITIVE
             or key.startswith("XDG_")
-            or (get_secret_source is not None and get_secret_source(key))
         ):
             env[key] = value
+    if secret_source_names is not None and get_secret is not None:
+        for key in secret_source_names():
+            value = get_secret(key)
+            if value is not None:
+                env[key] = value
     if user_env:
         env.update(user_env)
     return env
@@ -5239,6 +5257,48 @@ def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
     return _scoped()
 
 
+def _wrap_with_secret_scope(coro: "Coroutine") -> "Coroutine":
+    """Carry the caller's active secret scope into ``coro`` (TRI-482).
+
+    Same class of bug ``_wrap_with_home_override`` exists to fix, for a
+    different context value: tasks scheduled via ``run_coroutine_
+    threadsafe`` are created INSIDE the MCP loop thread, so they copy the
+    loop thread's own (ambient) context, never the scheduling thread's.
+    Every stdio MCP connection attempt runs through this dispatch point
+    (``_connect_server`` -> ``MCPServerTask.start`` -> ``_run_stdio`` ->
+    ``_build_safe_env``), so without this wrap, a per-request/per-profile
+    secret scope installed on the calling (routing) thread would simply
+    not exist once execution reaches the MCP loop thread.
+
+    That is NOT the original leak reappearing -- ``agent.secret_scope.
+    get_secret`` fails CLOSED under multiplex when no scope is installed
+    (raises ``UnscopedSecretError``), it never falls back to a stray
+    ``os.environ`` value. But it would turn every stdio MCP connection
+    made while multiplexing is active into a hard failure the moment any
+    profile enables a secret source -- trading a silent leak for a loud
+    break, neither of which is "the routed profile's own secret,
+    correctly". Returns ``coro`` unchanged when no scope is active
+    (single-profile deployments, multiplex-off, or a call already running
+    on a thread that never had one to begin with)."""
+    try:
+        from agent.secret_scope import current_secret_scope, reset_secret_scope, set_secret_scope
+
+        scope = current_secret_scope()
+    except Exception:
+        return coro
+    if scope is None:
+        return coro
+
+    async def _scoped():
+        token = set_secret_scope(scope)
+        try:
+            return await coro
+        finally:
+            reset_secret_scope(token)
+
+    return _scoped()
+
+
 def _wrap_with_dashboard_oauth_flow(coro):
     """Propagate a dashboard OAuth flow onto the dedicated MCP loop task."""
     try:
@@ -5295,6 +5355,12 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     # scopes don't interfere). No-op when no override is active.
     coro = _wrap_with_home_override(coro)
     coro = _wrap_with_dashboard_oauth_flow(coro)
+    # Same reason as the HOME override just above (TRI-482): a multiplexed
+    # secret scope installed on the scheduling thread would otherwise not
+    # exist once a stdio MCP connection's _build_safe_env runs on the MCP
+    # loop thread -- see _wrap_with_secret_scope's own docstring for why
+    # that turns into a hard connection failure, not the leak it fixes.
+    coro = _wrap_with_secret_scope(coro)
 
     future = safe_schedule_threadsafe(
         coro, loop,

@@ -1272,6 +1272,32 @@ class TestBuildSafeEnv:
         assert result["NOTION_TOKEN"] == "from-op"
         assert "UNTRACKED_SECRET_KEY" not in result
 
+    def test_secret_source_vars_resolve_through_active_profile_scope(self, monkeypatch):
+        """TRI-482 / upstream 580322ef1e: under multiplex the stdio child gets the ROUTED
+        profile's value for a source-tagged name, never the launch profile's os.environ
+        copy; a name the routed profile lacks is omitted entirely, not silently borrowed
+        from another profile."""
+        from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+        from hermes_cli import env_loader
+        from tools.mcp_tool import _build_safe_env
+
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "GITHUB_TOKEN", "bitwarden")
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "NOTION_TOKEN", "onepassword")
+        fake_env = {"PATH": "/usr/bin", "GITHUB_TOKEN": "default-profile",
+                   "NOTION_TOKEN": "default-notion"}
+        set_multiplex_active(True)
+        token = set_secret_scope({"GITHUB_TOKEN": "profile-b"})
+        try:
+            with patch.dict("os.environ", fake_env, clear=True):
+                result = _build_safe_env(None)
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
+
+        assert result["PATH"] == "/usr/bin"
+        assert result["GITHUB_TOKEN"] == "profile-b"
+        assert "NOTION_TOKEN" not in result
+
     def test_windows_location_vars_passed_without_secrets(self):
         """Windows launcher tools need location vars, but secrets stay filtered."""
         from tools.mcp_tool import _build_safe_env
@@ -1298,6 +1324,121 @@ class TestBuildSafeEnv:
         assert result["USERPROFILE"] == r"C:\Users\alice"
         assert "GITHUB_TOKEN" not in result
         assert "OPENAI_API_KEY" not in result
+
+
+# ---------------------------------------------------------------------------
+# Secret scope propagation across the real MCP-loop thread hop
+# ---------------------------------------------------------------------------
+
+class TestSecretScopeThreadHop:
+    """TRI-482: _build_safe_env's own unit tests call it directly, on the
+    test's own thread -- they cannot catch a propagation gap across the
+    run_coroutine_threadsafe hop _run_on_mcp_loop uses to reach the
+    background MCP event-loop thread (the same class of bug _wrap_with_
+    home_override already exists to fix for HERMES_HOME). These drive the
+    REAL hop: a scope installed on this thread, a coroutine that actually
+    runs on the separate _mcp_loop thread, asserting what THAT thread saw."""
+
+    def _start_real_mcp_loop(self):
+        import tools.mcp_tool as mcp
+        mcp._ensure_mcp_loop()
+        return mcp
+
+    def test_a_secret_scope_installed_here_is_visible_on_the_mcp_loop_thread(self, monkeypatch):
+        from agent.secret_scope import (
+            get_secret, reset_secret_scope, set_multiplex_active, set_secret_scope,
+        )
+        from hermes_cli import env_loader
+
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "GITHUB_TOKEN", "bitwarden")
+        mcp = self._start_real_mcp_loop()
+        set_multiplex_active(True)
+        token = set_secret_scope({"GITHUB_TOKEN": "profile-b"})
+        try:
+            async def _on_mcp_loop_thread():
+                # Proves this really runs off the calling thread: get_secret
+                # must see the scope THIS test installed, not "no scope" --
+                # which is exactly what the missing wrap would produce.
+                return get_secret("GITHUB_TOKEN")
+
+            result = mcp._run_on_mcp_loop(_on_mcp_loop_thread(), timeout=5)
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
+
+        assert result == "profile-b"
+
+    def test_a_full_build_safe_env_call_resolves_correctly_across_the_hop(self, monkeypatch):
+        """The end-to-end shape desktop-70 asked for: an actual _build_safe_env
+        call, driven through the real thread hop, under an active profile
+        scope -- not called directly on the test's own thread."""
+        from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+        from hermes_cli import env_loader
+
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "GITHUB_TOKEN", "bitwarden")
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "NOTION_TOKEN", "onepassword")
+        mcp = self._start_real_mcp_loop()
+        fake_env = {"PATH": "/usr/bin", "GITHUB_TOKEN": "default-profile",
+                   "NOTION_TOKEN": "default-notion"}
+        set_multiplex_active(True)
+        token = set_secret_scope({"GITHUB_TOKEN": "profile-b"})
+        try:
+            with patch.dict("os.environ", fake_env, clear=True):
+                async def _on_mcp_loop_thread():
+                    return mcp._build_safe_env(None)
+
+                result = mcp._run_on_mcp_loop(_on_mcp_loop_thread(), timeout=5)
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
+
+        assert result["PATH"] == "/usr/bin"
+        assert result["GITHUB_TOKEN"] == "profile-b"
+        assert "NOTION_TOKEN" not in result
+
+    def test_no_scope_installed_on_the_calling_thread_is_a_true_no_op(self):
+        """No scope to propagate -- _wrap_with_secret_scope must return the
+        coroutine unchanged, not raise or otherwise perturb a call that
+        never needed scoping at all (e.g. multiplex-off deployments)."""
+        mcp = self._start_real_mcp_loop()
+
+        async def _on_mcp_loop_thread():
+            return "ran"
+
+        assert mcp._run_on_mcp_loop(_on_mcp_loop_thread(), timeout=5) == "ran"
+
+    def test_the_scope_still_resolves_with_the_wrap_forced_to_a_no_op(self, monkeypatch):
+        """Documents an empirical finding from investigating this review
+        comment, rather than asserting the failure it first predicted:
+        asyncio.run_coroutine_threadsafe (what _run_on_mcp_loop schedules
+        onto) calls loop.call_soon_threadsafe(callback) with NO explicit
+        context= -- callback runs with contextvars.copy_context() taken at
+        the call_soon_threadsafe call site, i.e. the SCHEDULING thread's
+        context, restored on the loop thread. So the scope this test
+        installs already crosses the hop even with _wrap_with_secret_scope
+        forced to a no-op. Kept as a real, reproducible check on that
+        specific claim -- if this ever starts failing, it means Python's
+        own scheduling primitive stopped doing that, and _wrap_with_
+        secret_scope (which still runs on every call, redundant or not)
+        is the thing actually keeping this correct."""
+        from agent.secret_scope import get_secret, reset_secret_scope, set_multiplex_active, set_secret_scope
+        from hermes_cli import env_loader
+
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "GITHUB_TOKEN", "bitwarden")
+        mcp = self._start_real_mcp_loop()
+        monkeypatch.setattr(mcp, "_wrap_with_secret_scope", lambda coro: coro)
+        set_multiplex_active(True)
+        token = set_secret_scope({"GITHUB_TOKEN": "profile-b"})
+        try:
+            async def _on_mcp_loop_thread():
+                return get_secret("GITHUB_TOKEN")
+
+            result = mcp._run_on_mcp_loop(_on_mcp_loop_thread(), timeout=5)
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
+
+        assert result == "profile-b"
 
 
 # ---------------------------------------------------------------------------

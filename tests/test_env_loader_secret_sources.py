@@ -42,6 +42,22 @@ def test_get_secret_source_returns_label_for_tracked_var():
     assert env_loader.get_secret_source("ANTHROPIC_API_KEY") == "bitwarden"
 
 
+def test_secret_source_names_returns_no_names_when_none_tracked():
+    assert env_loader.secret_source_names() == ()
+
+
+def test_secret_source_names_returns_names_only_never_values():
+    """TRI-482: the map is process-wide across every served profile, so this
+    must expose which NAMES were source-tagged, never the (launch-profile-
+    only) values themselves -- a caller resolves the value per-profile
+    through agent.secret_scope.get_secret, not from here."""
+    env_loader._SECRET_SOURCES["GITHUB_TOKEN"] = "bitwarden"
+    env_loader._SECRET_SOURCES["NOTION_TOKEN"] = "onepassword"
+    names = env_loader.secret_source_names()
+    assert set(names) == {"GITHUB_TOKEN", "NOTION_TOKEN"}
+    assert all(isinstance(n, str) for n in names)
+
+
 def test_get_secret_source_values_returns_home_snapshot_copy(tmp_path):
     home_a = tmp_path / "profile-a"
     home_b = tmp_path / "profile-b"
